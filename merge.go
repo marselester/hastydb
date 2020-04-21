@@ -21,7 +21,7 @@ type record struct {
 	value string
 }
 
-// Merge merges multiple sorted streams into one sorted stream using min priority queue.
+// Merge merges and compacts multiple sorted streams into one sorted stream using min priority queue.
 func (sm *segmentMerger) Merge(out io.Writer, streams ...*bufio.Scanner) error {
 	pq := newIndexMinHeap(len(streams))
 
@@ -38,20 +38,30 @@ func (sm *segmentMerger) Merge(out io.Writer, streams ...*bufio.Scanner) error {
 		pq.Insert(i, rec)
 	}
 
-	// Take the smallest record from the priority queue (the min of all streams).
-	// Refill the priority queue from the stream where min record was found, unless this stream is exhausted.
+	var prev *record
 	for pq.Size() != 0 {
+		// Take the smallest record from the priority queue (the min of all streams).
 		i, rec = pq.Min()
-		sm.encode(out, rec)
 
+		// Keep only last version of a key (segment compaction).
+		if prev == nil {
+			prev = rec
+		}
+		if prev.key != rec.key {
+			sm.encode(out, prev)
+			prev = rec
+		}
+		prev.value = rec.value
+
+		// Refill the priority queue from the stream where min record was found, unless this stream is exhausted.
 		if !streams[i].Scan() {
 			continue
 		}
-
 		rec = sm.decode(streams[i].Bytes())
 		rec.order = i
 		pq.Insert(i, rec)
 	}
+	sm.encode(out, prev)
 
 	for i = range streams {
 		if err := streams[i].Err(); err != nil {
