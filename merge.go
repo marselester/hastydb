@@ -1,28 +1,90 @@
-package hastydb
+package hasty
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
+
+	"golang.org/x/sync/semaphore"
 )
 
+// newSegmentMerger creates a segmentMerger that merges segments once at a time.
+func newSegmentMerger(db *DB) *segmentMerger {
+	return &segmentMerger{
+		db:     db,
+		notif:  make(chan struct{}),
+		sem:    semaphore.NewWeighted(1),
+		encode: encode,
+		decode: decode,
+	}
+}
+
+// segmentMerger is an actor that is responsible for merging segments in background.
 type segmentMerger struct {
+	db    *DB
+	notif chan struct{}
+	sem   *semaphore.Weighted
+
 	decode func(b []byte) *record
 	encode func(out io.Writer, rec *record) error
 }
 
-// record represents a key-value pair read from a segment file.
-type record struct {
-	// key represents priority to arrange records in priority queue.
-	// When there are two records with the same key (equal priorities), then their order field is compared.
-	key string
-	// order is a stream number. It is used to return records in the order they were originally added.
-	order int
-	value string
+// Run starts the actor which is stopped by cancelling context.
+// Note, actor will finish its job before exiting or else the database might have partially merged segments.
+func (m *segmentMerger) Run(ctx context.Context) error {
+	for {
+		select {
+		case <-m.notif:
+			if !m.sem.TryAcquire(1) {
+				break
+			}
+
+			m.sem.Release(1)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
-// Merge merges and compacts multiple sorted streams into one sorted stream using min priority queue.
-func (sm *segmentMerger) Merge(out io.Writer, streams ...*bufio.Scanner) error {
+// Notify informs the actor to merge segments.
+// Note, if the merger is already busy, it ignores new notifications.
+func (m *segmentMerger) Notify() {
+	m.notif <- struct{}{}
+}
+
+// merge opens the oldest segments to merge and compact them.
+// The resulting segment is written on disk.
+func (m *segmentMerger) merge() (err error) {
+	s0, _ := openReadonlySegment("seg0")
+	defer s0.Close()
+
+	s1, _ := openReadonlySegment("seg1")
+	defer s1.Close()
+
+	combined, _ := openWriteonlySegment("seg2")
+	defer combined.Close()
+
+	streams := []*bufio.Scanner{
+		bufio.NewScanner(s0),
+		bufio.NewScanner(s1),
+	}
+	for i := range streams {
+		streams[i].Split(split)
+	}
+	if err = m.mergeStreams(combined, streams...); err != nil {
+		return fmt.Errorf("failed to merge segment streams: %w", err)
+	}
+
+	if err = combined.Flush(); err != nil {
+		return fmt.Errorf("failed to flush compacted segment: %w", err)
+	}
+
+	return nil
+}
+
+// merge merges and compacts multiple sorted streams into one sorted stream using min priority queue.
+func (m *segmentMerger) mergeStreams(out io.Writer, streams ...*bufio.Scanner) (err error) {
 	pq := newIndexMinHeap(len(streams))
 
 	// Fill the priority queue with the first records from each stream.
@@ -33,7 +95,7 @@ func (sm *segmentMerger) Merge(out io.Writer, streams ...*bufio.Scanner) error {
 			continue
 		}
 
-		rec = sm.decode(streams[i].Bytes())
+		rec = m.decode(streams[i].Bytes())
 		rec.order = i
 		pq.Insert(i, rec)
 	}
@@ -48,7 +110,9 @@ func (sm *segmentMerger) Merge(out io.Writer, streams ...*bufio.Scanner) error {
 			prev = rec
 		}
 		if prev.key != rec.key {
-			sm.encode(out, prev)
+			if err = m.encode(out, prev); err != nil {
+				return fmt.Errorf("failed to encode record: %w", err)
+			}
 			prev = rec
 		}
 		prev.value = rec.value
@@ -57,15 +121,17 @@ func (sm *segmentMerger) Merge(out io.Writer, streams ...*bufio.Scanner) error {
 		if !streams[i].Scan() {
 			continue
 		}
-		rec = sm.decode(streams[i].Bytes())
+		rec = m.decode(streams[i].Bytes())
 		rec.order = i
 		pq.Insert(i, rec)
 	}
-	sm.encode(out, prev)
+	if err = m.encode(out, prev); err != nil {
+		return fmt.Errorf("failed to encode record: %w", err)
+	}
 
 	for i = range streams {
-		if err := streams[i].Err(); err != nil {
-			return fmt.Errorf("stream %d failed: %w", i, err)
+		if err = streams[i].Err(); err != nil {
+			return fmt.Errorf("failed to merge %d stream: %w", i, err)
 		}
 	}
 	return nil
