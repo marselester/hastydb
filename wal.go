@@ -18,7 +18,8 @@ type wal struct {
 // openReadonlyWAL opens a WAL file for reading.
 func openReadonlyWAL(path string) (*wal, error) {
 	w := wal{
-		path: path,
+		path:   path,
+		encode: encode,
 	}
 
 	var err error
@@ -31,7 +32,8 @@ func openReadonlyWAL(path string) (*wal, error) {
 // openWritableWAL opens a WAL file for appending records.
 func openAppendonlyWAL(path string) (*wal, error) {
 	w := wal{
-		path: path,
+		path:   path,
+		encode: encode,
 	}
 
 	var err error

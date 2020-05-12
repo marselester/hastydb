@@ -1,8 +1,10 @@
-// Package hasty is a key-value LSM storage engine.
+// Package hasty is a key-value LSM storage engine, see the presentation
+// https://go-talks.appspot.com/github.com/marselester/storage-engines/log-structured-engine.slide.
 package hasty
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -34,8 +36,9 @@ type DB struct {
 
 // Open opens a database directory named path where it expects to find segment files.
 // If a database doesn't exist, it will be created.
-func Open(path string, options ...ConfigOption) (*DB, error) {
-	db := DB{
+// Make sure to close database to save recent changes on disk.
+func Open(path string, options ...ConfigOption) (db *DB, close func() error, err error) {
+	db = &DB{
 		path: path,
 		cfg: Config{
 			maxMemtableSize: DefaultMaxMemtableSize,
@@ -47,22 +50,31 @@ func Open(path string, options ...ConfigOption) (*DB, error) {
 		opt(&db.cfg)
 	}
 
-	var err error
 	if err = os.MkdirAll(db.path, 0700); err != nil {
-		return nil, fmt.Errorf("failed to create database dir: %w", err)
+		return nil, nil, fmt.Errorf("failed to create database dir: %w", err)
 	}
 
 	// If WAL is not empty, then the memtable probably was not saved last time,
 	// because the WAL file is truncated every time memtable is successfully written on disk.
 	walPath := filepath.Join(db.path, "wal")
 	if db.wal, err = openReadonlyWAL(walPath); err != nil {
-		return nil, err
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, nil, fmt.Errorf("failed to open WAL file to recover database: %w", err)
+		}
+	} else {
+		// Recover from WAL file and then truncate it...
+		if err = db.wal.Close(); err != nil {
+			return nil, nil, fmt.Errorf("failed to close WAL file after database recovery: %w", err)
+		}
+	}
+	if db.wal, err = openAppendonlyWAL(walPath); err != nil {
+		return nil, nil, fmt.Errorf("failed to open new WAL file: %w", err)
 	}
 
 	// Launch system workers that write memtable on disk, merge old segments.
 	g, ctx := errgroup.WithContext(context.Background())
-	db.sstWriter = newSSTableWriter(&db)
-	db.segMerger = newSegmentMerger(&db)
+	db.sstWriter = newSSTableWriter(db)
+	db.segMerger = newSegmentMerger(db)
 	g.Go(func() error {
 		<-db.quitc
 		return fmt.Errorf("hastydb was signalled to quit")
@@ -75,11 +87,11 @@ func Open(path string, options ...ConfigOption) (*DB, error) {
 	})
 	db.g = g
 
-	return &db, nil
+	return db, db.close, nil
 }
 
-// Close closes database and releases associated resources.
-func (db *DB) Close() error {
+// close closes database and releases associated resources.
+func (db *DB) close() error {
 	// Flush memtable on disk before exiting.
 	db.sstWriter.Notify()
 
@@ -95,7 +107,13 @@ func (db *DB) Set(key string, value []byte) error {
 	db.memtable.Set(key, value)
 	db.mu.Unlock()
 
-	db.wal.WriteRecord(&record{key: key, value: value})
+	err := db.wal.WriteRecord(&record{
+		key:   key,
+		value: value,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to write record to WAL file: %w", err)
+	}
 
 	// Trigger memtable rotation (save the current one on disk, create new memtable).
 	if db.memtable.Size() > db.cfg.maxMemtableSize {
