@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path/filepath"
 
 	"golang.org/x/sync/semaphore"
 
@@ -65,16 +66,16 @@ func (w *sstableWriter) flush() error {
 	w.db.memtable = &index.Memtable{}
 	w.db.mu.Unlock()
 
-	segName := "seg0"
-	s, err := openWriteonlySegment(segName)
+	segPath := filepath.Join(w.db.path, "seg0")
+	s, err := openWriteonlySegment(segPath)
 	if err != nil {
-		return fmt.Errorf("failed to open %q segment: %w", segName, err)
+		return fmt.Errorf("failed to open %q segment: %w", segPath, err)
 	}
 	if err = w.write(s.f, oldMem); err != nil {
-		return fmt.Errorf("failed to write %q segment: %w", segName, err)
+		return fmt.Errorf("failed to write %q segment: %w", segPath, err)
 	}
 	if err = s.Close(); err != nil {
-		return fmt.Errorf("failed to close %q segment: %w", segName, err)
+		return fmt.Errorf("failed to close %q segment: %w", segPath, err)
 	}
 
 	if err = w.db.wal.Truncate(); err != nil {

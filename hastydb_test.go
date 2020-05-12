@@ -23,7 +23,7 @@ func Example() {
 	}
 	fmt.Printf("%s\n", name)
 	// Output:
-	// Moist von Lipwig
+	// Alice
 
 	if err = close(); err != nil {
 		log.Fatal(err)

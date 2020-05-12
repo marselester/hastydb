@@ -27,11 +27,6 @@ type DB struct {
 
 	sstWriter *sstableWriter
 	segMerger *segmentMerger
-	// quitc signals the database workers to stop.
-	quitc    chan struct{}
-	quitOnce sync.Once
-	// g is a collection of workers that are stopped when quitc is closed.
-	g *errgroup.Group
 }
 
 // Open opens a database directory named path where it expects to find segment files.
@@ -44,7 +39,6 @@ func Open(path string, options ...ConfigOption) (db *DB, close func() error, err
 			maxMemtableSize: DefaultMaxMemtableSize,
 		},
 		memtable: &index.Memtable{},
-		quitc:    make(chan struct{}),
 	}
 	for _, opt := range options {
 		opt(&db.cfg)
@@ -72,33 +66,29 @@ func Open(path string, options ...ConfigOption) (db *DB, close func() error, err
 	}
 
 	// Launch system workers that write memtable on disk, merge old segments.
-	g, ctx := errgroup.WithContext(context.Background())
+	ctx, quit := context.WithCancel(context.Background())
+	g, ctx := errgroup.WithContext(ctx)
 	db.sstWriter = newSSTableWriter(db)
 	db.segMerger = newSegmentMerger(db)
-	g.Go(func() error {
-		<-db.quitc
-		return fmt.Errorf("hastydb was signalled to quit")
-	})
 	g.Go(func() error {
 		return db.sstWriter.Run(ctx)
 	})
 	g.Go(func() error {
 		return db.segMerger.Run(ctx)
 	})
-	db.g = g
 
-	return db, db.close, nil
-}
+	// Close database and releases associated resources.
+	close = func() error {
+		// Flush memtable on disk before exiting.
+		db.sstWriter.Notify()
+		quit()
+		if err := g.Wait(); err != context.Canceled {
+			return err
+		}
+		return nil
+	}
 
-// close closes database and releases associated resources.
-func (db *DB) close() error {
-	// Flush memtable on disk before exiting.
-	db.sstWriter.Notify()
-
-	db.quitOnce.Do(func() {
-		close(db.quitc)
-	})
-	return db.g.Wait()
+	return db, close, nil
 }
 
 // Set puts a key in database. Note, operation is concurrency safe.
