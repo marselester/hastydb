@@ -140,11 +140,6 @@ handprinted:33632`,
 		encode: plainEncode,
 	}
 	segName := "testdata/writesegment"
-	t.Cleanup(func() {
-		if err := os.Remove(segName); err != nil {
-			t.Errorf("failed to remove %q segment: %w", segName, err)
-		}
-	})
 
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -153,6 +148,11 @@ handprinted:33632`,
 				t.Fatal(err)
 			}
 			seg.encode = plainEncode
+			t.Cleanup(func() {
+				if err := os.Remove(segName); err != nil {
+					t.Errorf("failed to remove %q segment: %w", segName, err)
+				}
+			})
 
 			mem := index.Memtable{}
 			scanner := bufio.NewScanner(strings.NewReader(tc.log))

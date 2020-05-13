@@ -41,14 +41,14 @@ func openReadonlySegment(path string) (*segment, error) {
 	return &s, nil
 }
 
-// openReadonlySegment opens a segment file for writing.
+// openWriteonlySegment opens a new segment file for writing.
 func openWriteonlySegment(path string) (*segment, error) {
 	s := segment{
 		path: path,
 	}
 
 	var err error
-	if s.f, err = os.Create(path); err != nil {
+	if s.f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600); err != nil {
 		return nil, err
 	}
 	return &s, nil
