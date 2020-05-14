@@ -352,6 +352,42 @@ func TestMemtableKeys(t *testing.T) {
 	}
 }
 
+func TestMemtableSize(t *testing.T) {
+	tests := []struct {
+		key   string
+		value []byte
+		want  int
+	}{
+		{"s", nil, 1},
+		{"e", []byte("e"), 3},
+		{"a", nil, 4},
+		{"r", []byte("rr"), 7},
+		{"c", nil, 8},
+		{"h", []byte("hhh"), 12},
+		{"x", nil, 13},
+		{"m", nil, 14},
+		{"p", []byte("p"), 16},
+		{"l", nil, 17},
+		{"s", []byte("ss"), 19},
+		{"s", []byte("s"), 18},
+		{"h", []byte("h"), 16},
+	}
+
+	tree := Memtable{}
+	got := tree.Size()
+	if got != 0 {
+		t.Fatalf("expected: 0 got: %d", got)
+	}
+
+	for _, tc := range tests {
+		tree.Set(tc.key, tc.value)
+		got = tree.Size()
+		if got != tc.want {
+			t.Fatalf("%s: expected: %d got: %d", tc.key, tc.want, got)
+		}
+	}
+}
+
 func equal(s1, s2 []string) bool {
 	if len(s1) != len(s2) {
 		return false

@@ -35,8 +35,6 @@ After insertion perform balancing operations on the way up the tree:
 */
 type Memtable struct {
 	root *node
-	// size represents memtable size in bytes.
-	size int
 }
 type node struct {
 	// key is a unique comparable key, e.g., name.
@@ -49,6 +47,8 @@ type node struct {
 	left *node
 	// right is pointer to the right subtree where larger keys are stored.
 	right *node
+	// size represents size in bytes of the subtree rooted at the node.
+	size int
 }
 
 // isRed returns true if its link to parent is red.
@@ -82,9 +82,9 @@ func (t *Memtable) Keys() []string {
 	return keys(nil, t.root)
 }
 
-// Size returns memtable size in bytes.
+// Size returns memtable size in bytes calculated as a sum of all its keys and values.
 func (t *Memtable) Size() int {
-	return t.size
+	return subtreeSize(t.root)
 }
 
 // search recursively looks up node by key starting from node n.
@@ -110,7 +110,12 @@ func search(key string, n *node) *node {
 // If key is not found, the new node with red link is added to the tree.
 func put(key string, value []byte, n *node) *node {
 	if n == nil {
-		return &node{key: key, value: value, color: red}
+		return &node{
+			key:   key,
+			value: value,
+			color: red,
+			size:  len(key) + len(value),
+		}
 	}
 
 	if key < n.key {
@@ -131,6 +136,8 @@ func put(key string, value []byte, n *node) *node {
 	if n.left.isRed() && n.right.isRed() {
 		flipColors(n)
 	}
+
+	n.size = subtreeSize(n.left) + subtreeSize(n.right) + len(n.key) + len(n.value)
 	return n
 }
 
@@ -149,6 +156,8 @@ func rotateLeft(h *node) *node {
 	x.color = h.color
 	// H is now leaning left, so the link is marked red.
 	h.color = red
+	x.size = h.size
+	h.size = subtreeSize(h.left) + subtreeSize(h.right) + len(h.key) + len(h.value)
 	return x
 }
 
@@ -161,6 +170,8 @@ func rotateRight(h *node) *node {
 	x.right = h
 	x.color = h.color
 	h.color = red
+	x.size = h.size
+	h.size = subtreeSize(h.left) + subtreeSize(h.right) + len(h.key) + len(h.value)
 	return x
 }
 
@@ -182,4 +193,12 @@ func keys(kk []string, n *node) []string {
 	kk = append(kk, n.key)
 	kk = keys(kk, n.right)
 	return kk
+}
+
+// subtreeSize returns size in bytes of the subtree rooted at the node.
+func subtreeSize(n *node) int {
+	if n == nil {
+		return 0
+	}
+	return n.size
 }
