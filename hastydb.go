@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -21,9 +22,17 @@ type DB struct {
 	path string
 	cfg  Config
 
-	mu       sync.RWMutex
-	memtable *index.Memtable
-	wal      *wal
+	memMu            sync.RWMutex
+	memtable         *index.Memtable
+	flushingMemtable *index.Memtable
+
+	// wal is a write-ahead log file where records are appended to recover from a database crash.
+	wal *wal
+
+	segMu sync.Mutex
+	// segments is a slice of segment files where records are stored.
+	// Newest segments are in the beginning of the slice.
+	segments atomic.Value
 
 	sstWriter *sstableWriter
 	segMerger *segmentMerger
@@ -93,9 +102,9 @@ func Open(path string, options ...ConfigOption) (db *DB, close func() error, err
 
 // Set puts a key in database. Note, operation is concurrency safe.
 func (db *DB) Set(key string, value []byte) error {
-	db.mu.Lock()
+	db.memMu.Lock()
 	db.memtable.Set(key, value)
-	db.mu.Unlock()
+	db.memMu.Unlock()
 
 	err := db.wal.WriteRecord(&record{
 		key:   key,
@@ -114,8 +123,32 @@ func (db *DB) Set(key string, value []byte) error {
 }
 
 // Get retrieves a key from database. Note, operation is concurrency safe.
-func (db *DB) Get(key string) ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return db.memtable.Get(key), nil
+func (db *DB) Get(key string) (value []byte, err error) {
+	db.memMu.RLock()
+	value = db.memtable.Get(key)
+	if value == nil && db.flushingMemtable != nil {
+		value = db.flushingMemtable.Get(key)
+	}
+	db.memMu.RUnlock()
+
+	if value != nil {
+		return value, nil
+	}
+
+	ss := db.segments.Load().([]*segment)
+	var (
+		found  bool
+		offset int64
+		rec    *record
+	)
+	for i := range ss {
+		if offset, found = ss[i].index[key]; found {
+			if rec, err = ss[i].ReadRecord(offset); err != nil {
+				return nil, fmt.Errorf("failed to read record: %w", err)
+			}
+			return rec.value, nil
+		}
+	}
+
+	return nil, ErrKeyNotFound
 }

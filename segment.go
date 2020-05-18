@@ -8,13 +8,6 @@ import (
 	"os"
 )
 
-const (
-	// recordLenSize is a record length in bytes needed to encode uint32.
-	recordLenSize = 4
-	// kvDelimeter is a delimiter between key and value in segment's record.
-	kvDelimeter = byte('\x00')
-)
-
 // segment represents a log file which is stored in SSTable format.
 type segment struct {
 	// path is a path to the segment file.
@@ -24,6 +17,7 @@ type segment struct {
 	// Every key is mapped to a byte offset in the segment file where value is stored.
 	index map[string]int64
 
+	decode func(b []byte) *record
 	encode func(out io.Writer, rec *record) error
 }
 
@@ -76,6 +70,29 @@ func (s *segment) Flush() error {
 	return s.f.Sync()
 }
 
+// ReadRecord reads a record (key-value pair) by the offset from the segment file.
+func (s *segment) ReadRecord(offset int64) (*record, error) {
+	recordLen := make([]byte, recordLengthSize)
+	if _, err := s.f.ReadAt(recordLen, offset); err != nil {
+		return nil, err
+	}
+	blen := binary.LittleEndian.Uint32(recordLen)
+
+	b := make([]byte, blen)
+	if _, err := s.f.ReadAt(b, offset); err != nil {
+		return nil, err
+	}
+
+	return s.decode(b), nil
+}
+
+const (
+	// recordLengthSize is a number of bytes needed to read a record from a file.
+	// 4 bytes are required for uint32 which gives max 4.295 GB record length.
+	recordLengthSize        = 4
+	recordKeyValueDelimeter = byte('\x00')
+)
+
 // record represents a key-value pair in a segment file.
 type record struct {
 	// key represents priority to arrange records in priority queue during segment merging.
@@ -97,15 +114,15 @@ func encode(out io.Writer, rec *record) (err error) {
 
 	ew := &errWriter{Writer: out}
 	ew.Write([]byte(rec.key))
-	ew.Write([]byte{kvDelimeter})
+	ew.Write([]byte{recordKeyValueDelimeter})
 	ew.Write(rec.value)
 	return ew.err
 }
 
 // decode returns key-value from encoded byte slice b.
 func decode(b []byte) *record {
-	b = b[recordLenSize:]
-	i := bytes.IndexByte(b, kvDelimeter)
+	b = b[recordLengthSize:]
+	i := bytes.IndexByte(b, recordKeyValueDelimeter)
 	if i == -1 {
 		return nil
 	}
@@ -122,13 +139,13 @@ func decode(b []byte) *record {
 // Max record len is 4,294,967,295 (4.295 GB).
 // For example, start from 0 offset, read key-value pair, move to offset += recordLen(key, value).
 func recordLen(key string, value []byte) uint32 {
-	return recordLenSize + uint32(len(key)) + 1 + uint32(len(value))
+	return recordLengthSize + uint32(len(key)) + 1 + uint32(len(value))
 }
 
 // split is a split function used to tokenize the input from segment file.
 func split(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	for i := 0; i < len(data); i++ {
-		if data[i] == kvDelimeter {
+		if data[i] == recordKeyValueDelimeter {
 			return i + 1, data[:i], nil
 		}
 	}
@@ -139,23 +156,4 @@ func split(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	// Returning bufio.ErrFinalToken here tells Scan there are no more tokens after this
 	// but does not trigger an error to be returned from Scan itself.
 	return 0, data, bufio.ErrFinalToken
-}
-
-// errWriter fulfils the io.Writer contract so it can be used to wrap an existing io.Writer.
-// errWriter passes writes through to its underlying writer until an error is detected.
-// From that point on, it discards any writes and returns the previous error.
-// See https://dave.cheney.net/2019/01/27/eliminate-error-handling-by-eliminating-errors.
-type errWriter struct {
-	io.Writer
-	err error
-}
-
-func (e *errWriter) Write(buf []byte) (int, error) {
-	if e.err != nil {
-		return 0, e.err
-	}
-
-	var n int
-	n, e.err = e.Writer.Write(buf)
-	return n, nil
 }

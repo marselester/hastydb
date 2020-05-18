@@ -59,28 +59,42 @@ func (w *sstableWriter) Notify() {
 
 // flush creates a new memtable and persists the previous memtable on disk.
 func (w *sstableWriter) flush() error {
-	w.db.mu.Lock()
-	oldMem := w.db.memtable
-	// New writes don't have to wait and should go into the new memtable.
-	// Meanwhile the old memtable is being saved on disk.
+	// New writes go into the new memtable and it also serves reads.
+	// Meanwhile the old memtable is being saved on disk,
+	// it remains available for reads until it's fully written on disk.
+	w.db.memMu.Lock()
+	w.db.flushingMemtable = w.db.memtable
 	w.db.memtable = &index.Memtable{}
-	w.db.mu.Unlock()
+	w.db.memMu.Unlock()
 
 	segPath := filepath.Join(w.db.path, "seg0")
-	s, err := openWriteonlySegment(segPath)
+	seg, err := openWriteonlySegment(segPath)
 	if err != nil {
 		return fmt.Errorf("failed to open %q segment: %w", segPath, err)
 	}
-	if err = w.write(s.f, oldMem); err != nil {
+	if err = w.write(seg.f, w.db.flushingMemtable); err != nil {
 		return fmt.Errorf("failed to write %q segment: %w", segPath, err)
 	}
-	if err = s.Close(); err != nil {
+	if err = seg.Close(); err != nil {
 		return fmt.Errorf("failed to close %q segment: %w", segPath, err)
 	}
+
+	// Add new segment file at the beginning of the database's segments list.
+	w.db.segMu.Lock()
+	current := w.db.segments.Load().([]*segment)
+	ss := make([]*segment, len(current)+1)
+	copy(ss[1:], current)
+	ss[0] = seg
+	w.db.segments.Store(ss)
+	w.db.segMu.Unlock()
 
 	if err = w.db.wal.Truncate(); err != nil {
 		return fmt.Errorf("failed to truncate WAL: %w", err)
 	}
+
+	w.db.memMu.Lock()
+	w.db.flushingMemtable = nil
+	w.db.memMu.Unlock()
 
 	return nil
 }
